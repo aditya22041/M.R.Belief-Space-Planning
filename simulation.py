@@ -1,259 +1,157 @@
 # simulation.py
-import time
-import argparse
-import random
+
 import numpy as np
-from scipy.signal import convolve2d
 import matplotlib.pyplot as plt
-
-import config
-from terrain import TerrainGenerator
-from belief import BeliefModule, kl_divergence
+import time
+from environment import Environment
+from robot import Robot
 from communication import CommunicationManager
-from planner import DStarLitePlanner, RRTStarPlanner
-from allocator import cvt_partition, voronoi_partition, auction_partition
+from config import GRID_SIZE, NUM_ROBOTS, MAX_STEPS
 
-ALLOC_INTERVAL = getattr(config, 'ALLOC_INTERVAL', 5)
-COMM_INTERVAL  = config.COMM_INTERVAL
+def run_simulation():
+    start_time = time.time()
 
-class RobotAgent:
-    def __init__(self, robot_id, start_pos, grid_shape):
-        self.id             = robot_id
-        self.pos            = tuple(start_pos)
-        self.belief         = BeliefModule(grid_shape)
-        self.known_map      = np.full(grid_shape, -1, dtype=np.int8)
-        self.confirmed      = set()
-        self.new_observed   = set()
-        self.new_confirmed  = set()
-        self.comm_count     = 0
-        self.path           = []
-        self.target         = self.pos
+    # 1) Initialize environment & robots
+    env = Environment(GRID_SIZE)
+    free_cells = np.argwhere(env.reachable & (env.terrain_map == 0))
+    num_free = len(free_cells)
+    actual_robots = min(NUM_ROBOTS, num_free)
+    if actual_robots < NUM_ROBOTS:
+        print(f"Warning: Only {actual_robots} robots placed (free cells < requested).")
+    if num_free == 0:
+        print("Error: No free cells to place robots. Exiting.")
+        return
 
-    def sense(self, terrain, victims):
-        r = config.SENSOR_RADIUS
-        h, w = terrain.shape
-        obs_pos, obs_code = [], []
-        for dx in range(-r, r+1):
-            for dy in range(-r, r+1):
-                i, j = self.pos[0]+dx, self.pos[1]+dy
-                if not (0<=i<h and 0<=j<w): continue
-                truth = 1 if terrain[i,j]==1 else (2 if (i,j) in victims else 0)
-                if truth==2:
-                    obs = 2 if random.random()<config.DETECTION_PROB else 0
-                elif truth==0:
-                    obs = 2 if random.random()<config.FALSE_POS_PROB else 0
-                else:
-                    obs = 1
-                prev = self.known_map[i,j]
-                val  = 1 if obs==1 else 0
-                self.known_map[i,j] = val
-                if prev<0:
-                    self.new_observed.add((i,j))
-                obs_pos.append((i,j)); obs_code.append(obs)
+    rng = np.random.default_rng()
+    chosen_idx = rng.choice(num_free, size=actual_robots, replace=False)
+    robot_positions = free_cells[chosen_idx]
+    robots = [
+        Robot(i, tuple(robot_positions[i]), (GRID_SIZE, GRID_SIZE))
+        for i in range(actual_robots)
+    ]
 
-        import torch
-        coords = np.array(obs_pos, dtype=int)
-        pos_t  = torch.from_numpy(coords).long().to(self.belief.device)
-        obs_t  = torch.tensor(obs_code, dtype=torch.long, device=self.belief.device)
-        self.belief.update(pos_t, obs_t)
+    comm = CommunicationManager(robots)
 
-    def confirm_by_posterior(self, thresh, true_victims):
-        post = self.belief.belief.detach().cpu().numpy()[...,2]
-        for cell in zip(*np.where(post >= thresh)):
-            if cell in true_victims and cell not in self.confirmed:
-                self.confirmed.add(cell)
-                self.new_confirmed.add(cell)
+    # Initial plot: obstacles=black, free=white, plus true victims
+    fig, ax = plt.subplots(figsize=(8,8))
+    ax.imshow(1 - env.terrain_map, cmap='gray', origin='lower')
+    tv = np.argwhere(env.victim_map)
+    if len(tv) > 0:
+        ax.scatter(tv[:,1], tv[:,0], c='green', marker='x', label='True Victims')
+    ax.legend()
+    ax.set_title("Initial Terrain (white=free, black=obstacle) & True Victims (green x)")
+    plt.savefig('initial_map.png')
+    plt.show()
 
-    def plan(self, terrain):
-        if self.pos == self.target or not self.path:
-            if config.PLANNER_TYPE == 'DSTAR_LITE':
-                planner = DStarLitePlanner(terrain, self.pos, self.target)
-                self.path = planner.plan()
-            else:
-                def free_chk(pt):
-                    x, y = map(int, pt)
-                    return (0<=x<terrain.shape[0] and 0<=y<terrain.shape[1]
-                            and terrain[x,y]==0)
-                bounds = ((0,0),(terrain.shape[0],terrain.shape[1]))
-                self.path = RRTStarPlanner(self.pos, self.target,
-                                           free_chk, bounds).plan()
+    select_t = sense_t = move_t = comm_t = 0.0
 
-    def move(self):
-        if len(self.path) > 1:
-            self.pos  = tuple(self.path[1])
-            self.path = self.path[1:]
-        else:
-            for dx,dy in [(1,0),(-1,0),(0,1),(0,-1)]:
-                ni, nj = self.pos[0]+dx, self.pos[1]+dy
-                if (0<=ni<self.known_map.shape[0]
-                        and 0<=nj<self.known_map.shape[1]
-                        and self.known_map[ni,nj]==0):
-                    self.pos = (ni,nj)
-                    break
-
-
-def run_simulation(args):
-    # Generate map and victims
-    tg      = TerrainGenerator(seed=args.seed)
-    terrain, victims = tg.generate()
-    shape   = terrain.shape
-
-    # Plot initial map
-    plt.figure(figsize=(6,6))
-    plt.imshow(terrain, cmap='gray_r', origin='lower')
-    vx, vy = zip(*victims)
-    plt.scatter(vy, vx, facecolors='none', edgecolors='red', s=50, label='True victims')
-    plt.title('Initial Terrain (white=free, black=obstacle) & True Victims')
-    plt.legend(); plt.show()
-
-    # Initialize robots
-    free    = list(zip(*np.where(terrain==0)))
-    random.shuffle(free)
-    robots  = [RobotAgent(i, free[i%len(free)], shape)
-               for i in range(args.num_robots)]
-    comm    = CommunicationManager(robots)
-
-    total_cells   = shape[0]*shape[1]
-    coverage_ts   = []
-    comm_ts       = []
-    confirmed_ts  = []
-    comm_cum_ts   = []
-
-    t0 = time.time()
-    global_map = np.full(shape, -1, dtype=np.int8)
-
-    # plateau tracking
-    plateau_count = 0
-    last_alloc_cov = -1
-
-    for step in range(args.max_steps):
-        # 1) sense & belief update
-        for r in robots: r.sense(terrain, victims)
-
-        # 2) confirm victims
+    # Main simulation loop
+    for step in range(MAX_STEPS):
         for r in robots:
-            r.confirm_by_posterior(args.confirm_belief_thresh, set(victims))
+            # Target selection
+            t0 = time.time()
+            r.select_target(step, robots)
+            select_t += time.time() - t0
 
-        # 3) update shared map & coverage
-        for r in robots:
-            for cell in r.new_observed:
-                global_map[cell] = r.known_map[cell]
-            r.new_observed.clear()
-        seen     = np.count_nonzero(global_map >= 0)
-        coverage = 100 * seen / total_cells
-        coverage_ts.append(coverage)
+            # Sensing
+            t1 = time.time()
+            r.sense(env.terrain_map, env.victim_map)
+            sense_t += time.time() - t1
 
-        # 4) allocation & planning
-        if step % ALLOC_INTERVAL == 0:
-            # detect plateau
-            if coverage <= last_alloc_cov:
-                plateau_count += 1
-            else:
-                plateau_count = 0
-            last_alloc_cov = coverage
+            # Movement & broadcast
+            t2 = time.time()
+            r.move(comm)
+            move_t += time.time() - t2
 
-            unk   = (global_map == -1).astype(int)
-            kern  = np.array([[0,1,0],[1,0,1],[0,1,0]])
-            neigh = convolve2d(unk, kern, mode='same', boundary='fill', fillvalue=0)
-            frontiers     = list(zip(*np.where((global_map==0)&(neigh>0))))
-            unknown_cells = list(zip(*np.where(global_map==-1)))
+        # Communication step
+        t3 = time.time()
+        comm.step()
+        comm_t += time.time() - t3
 
-            # always explorers: half the robots
-            num_explorers = len(robots)//2
-            explorers     = set(range(num_explorers))
+    # Build global maps
+    global_explored = np.any([r.explored_map for r in robots], axis=0)
+    global_detected = np.any([
+        (r.confidence_map.belief[:,:,2] > 0.8) & r.victim_map
+        for r in robots
+    ], axis=0)
 
-            # if plateau or no frontiers, random targets for all
-            if plateau_count >= 2 or not frontiers:
-                for r in robots:
-                    if unknown_cells:
-                        r.target = random.choice(unknown_cells)
-                    r.plan(terrain)
-                plateau_count = 0
-            else:
-                # partition actual frontiers
-                if config.COVERAGE_STRATEGY=='CVT':
-                    _, clusters = cvt_partition(frontiers, len(robots))
-                elif config.COVERAGE_STRATEGY=='Voronoi':
-                    clusters = voronoi_partition(frontiers, [r.pos for r in robots])
-                else:
-                    clusters = auction_partition(frontiers, [r.pos for r in robots])
+    print("\n=== Simulation Summary ===")
+    print("\nOriginal Terrain Map (top-left 10×10):")
+    print(env.terrain_map[:10, :10])
 
-                for r in robots:
-                    # explorers always random
-                    if r.id in explorers and unknown_cells:
-                        r.target = random.choice(unknown_cells)
-                    else:
-                        targets = clusters.get(r.id, []) or unknown_cells
-                        r.target = min(targets, key=lambda p: abs(p[0]-r.pos[0]) + abs(p[1]-r.pos[1]))
-                    r.plan(terrain)
+    for r in robots:
+        explored_area = np.sum(r.explored_map)
+        dets = np.argwhere((r.confidence_map.belief[:,:,2] > 0.8) & r.victim_map)
+        locs = [(int(x), int(y)) for x,y in dets]
+        print(f"\nRobot {r.id}:")
+        print(f"  Final Position: ({r.pos[0]}, {r.pos[1]})")
+        print(f"  Area Explored: {explored_area} cells")
+        print(f"  Explored Map (top-left 10×10):")
+        print(r.explored_map[:10, :10].astype(int))
+        print(f"  Detected Victims: {locs if locs else 'None'}")
+        print(f"  Communication Count: {r.comm_count}")
 
-        # 5) move
-        for r in robots: r.move()
+    # Victim detection metrics
+    true_set = set(map(tuple, np.argwhere(env.victim_map).tolist()))
+    det_set  = set(map(tuple, np.argwhere(global_detected).tolist()))
+    correct    = len(true_set & det_set)
+    false_pos  = len(det_set - true_set)
+    missed     = len(true_set - det_set)
+    prec = correct / (correct + false_pos) if (correct + false_pos) > 0 else 0.0
+    rec  = correct / len(true_set) if len(true_set) > 0 else 0.0
 
-        # 6) communication
-        prev_comm = sum(r.comm_count for r in robots)
-        if step % COMM_INTERVAL == 0 and any(r.new_confirmed for r in robots):
-            comm.step()
-        comm_delta = sum(r.comm_count for r in robots) - prev_comm
-        comm_ts.append(comm_delta)
+    print("\nVictim Detection Metrics:")
+    print(f"  True Victims: {len(true_set)}")
+    print(f"  Correct Detections: {correct}")
+    print(f"  False Positives: {false_pos}")
+    print(f"  Missed Victims: {missed}")
+    print(f"  Precision: {prec:.2f}")
+    print(f"  Recall: {rec:.2f}")
 
-        # 7) stats
-        total_conf = len(set().union(*(r.confirmed for r in robots)))
-        confirmed_ts.append(total_conf)
-        comm_cum_ts.append(sum(r.comm_count for r in robots))
+    # Final plots
+    fig, axes = plt.subplots(1, 3, figsize=(24,8))
 
-        # 8) KL convergence
-        maps = [r.belief.belief.detach().cpu().numpy()[...,2] for r in robots]
-        max_kl = 0
-        for i in range(len(maps)):
-            for j in range(i+1, len(maps)):
-                max_kl = max(max_kl, kl_divergence(maps[i].ravel(), maps[j].ravel()))
-        if max_kl < config.KL_CONV_THRESH:
-            print(f"Beliefs converged at step {step+1} (max KL={max_kl:.2e})")
-            break
+    # 1) Terrain + Explored + Robots
+    axes[0].imshow(1 - env.terrain_map, cmap='gray', origin='lower')
+    axes[0].imshow(global_explored, cmap='Blues', alpha=0.5, origin='lower')
+    for i, r in enumerate(robots):
+        axes[0].plot(r.pos[1], r.pos[0], 'bo', label='Robot' if i == 0 else None)
+    axes[0].legend()
+    axes[0].set_title("Terrain + Explored + Final Robot Positions")
 
-    # final report
-    elapsed   = time.time() - t0
-    confirmed = set().union(*(r.confirmed for r in robots))
-    comms     = [r.comm_count for r in robots]
-    positions = [r.pos for r in robots]
+    # 2) True vs Detected Victims
+    axes[1].imshow(1 - env.terrain_map, cmap='gray', origin='lower')
+    if len(tv) > 0:
+        axes[1].scatter(tv[:,1], tv[:,0], c='green', marker='x', label='True Victims')
+    dv = np.argwhere(global_detected)
+    if dv.size > 0:
+        axes[1].scatter(dv[:,1], dv[:,0], c='red', marker='o', label='Detected')
+    axes[1].legend()
+    axes[1].set_title("True (green x) vs Detected (red circle) Victims")
 
-    print("\n===== Simulation Report =====")
-    print(f"Elapsed     : {elapsed:.2f}s   Steps: {step+1}")
-    print(f"Coverage    : {coverage_ts[-1]:.2f}%  ({seen}/{total_cells})")
-    print(f"Victims hit : {len(confirmed)}/{len(victims)}")
-    print(f"Confirmed   : {sorted((int(x),int(y)) for x,y in confirmed)}")
-    print(f"Comms       : min={min(comms)}, max={max(comms)}, avg={np.mean(comms):.2f}")
-    print(f"Positions   : {[(int(x),int(y)) for x,y in positions]}")
-    print("============================\n")
+    # 3) Robot Positions & “Long” Communication Counts
+    axes[2].set_xlim(-1, GRID_SIZE)
+    axes[2].set_ylim(-1, GRID_SIZE)
+    for i, r in enumerate(robots):
+        axes[2].plot(r.pos[1], r.pos[0], 'bo', label='Robot' if i == 0 else None)
+        if r.comm_count > 0:
+            axes[2].text(r.pos[1], r.pos[0], f"{r.comm_count}", color='purple')
+    axes[2].legend()
+    axes[2].set_title("Robot Positions & Communication Counts")
 
-    # plots
-    plt.figure(figsize=(6,3)); plt.plot(coverage_ts, label='Coverage %')
-    plt.xlabel('Step'); plt.ylabel('Coverage %'); plt.title('Coverage over Time'); plt.grid(True); plt.legend(); plt.show()
+    plt.tight_layout()
+    plt.savefig('simulation_results.png')
+    plt.show()
 
-    plt.figure(figsize=(6,3)); plt.plot(comm_ts, label='Comm Δ')
-    plt.xlabel('Step'); plt.ylabel('# Comm events'); plt.title('Communication Events per Interval'); plt.grid(True); plt.legend(); plt.show()
+    end_time = time.time()
+    print("\nPerformance Breakdown:")
+    print(f"  Target Selection Time: {select_t:.2f}s")
+    print(f"  Sensing Time: {sense_t:.2f}s")
+    print(f"  Movement Time: {move_t:.2f}s")
+    print(f"  Communication Time: {comm_t:.2f}s")
+    print(f"Total Simulation Time: {end_time - start_time:.2f}s")
+    print(f"Total Free Cells: {num_free}")
+    print(f"Robots Placed: {actual_robots}")
 
-    new_per_step = np.diff([0] + confirmed_ts)
-    plt.figure(figsize=(6,3)); plt.bar(range(len(new_per_step)), new_per_step, color='tab:orange', label='New victims')
-    plt.xlabel('Step'); plt.ylabel('# New confirmed'); plt.title('Victims Discovered per Step'); plt.grid(True); plt.legend(); plt.show()
-
-    plt.figure(figsize=(6,3)); plt.plot(comm_cum_ts, label='Total Comm so far')
-    plt.xlabel('Step'); plt.ylabel('Total comm events'); plt.title('Cumulative Communication Load'); plt.grid(True); plt.legend(); plt.show()
-
-    # final heatmap overlay
-    avg_map = np.mean(maps, axis=0)
-    plt.figure(figsize=(6,6)); plt.imshow(avg_map, cmap='viridis', origin='lower')
-    plt.colorbar(label='Avg P(victim)')
-    plt.scatter([c[1] for c in confirmed], [c[0] for c in confirmed], c='red', marker='x', label='Confirmed')
-    plt.scatter([v[1] for v in victims], [v[0] for v in victims], facecolors='none', edgecolors='white', label='True victims')
-    plt.title('Fleet-wide Average Victim Probability\n(white circles=true, red X=confirmed)')
-    plt.legend(loc='upper right'); plt.show()
-
-if __name__=='__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--num-robots', type=int, default=config.NUM_ROBOTS)
-    parser.add_argument('--max-steps',  type=int, default=200)
-    parser.add_argument('--confirm-belief-thresh', type=float, default=0.6)
-    parser.add_argument('--seed', type=int, default=0)
-    run_simulation(parser.parse_args())
+if __name__ == "__main__":
+    run_simulation()

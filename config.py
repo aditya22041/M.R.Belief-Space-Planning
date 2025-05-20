@@ -1,57 +1,25 @@
 # config.py
-# -*- coding: utf-8 -*-
 
-import os
-import logging
+# Grid and robot parameters
+GRID_SIZE = 100               # Side length of the square grid
+NUM_ROBOTS = 10               # Number of robots
+ROBOT_SPEED = 2               # Cells moved per step (increase to move faster)
+SENSE_RANGE = 2               # Manhattan‐radius of sensing (2 → 5×5 window). Adjustable.
+ALLOC_INTERVAL = 40           # Steps between re‐computing assignment partition
+MAX_STEPS = 300               # Total simulation steps
 
-# Logging
-LOG_DIR = "./logs"
-os.makedirs(LOG_DIR, exist_ok=True)
-logging.basicConfig(
-    filename=os.path.join(LOG_DIR, "mr_bsp.log"),
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger("MRBSP")
-
-# Map dimensions & density
-MAP_SIZE = 100                # 1000x1000 grid
-OBSTACLE_DENSITY = 0.2         # fraction of obstacles
-NUM_VICTIMS = 50
-
-# Robot fleet
-NUM_ROBOTS = 10
-SENSOR_RADIUS = 5              # Manhattan radius sensing
-COMM_RANGE = 100               # communication radius
-MAX_COMM_EVENTS = 5            # max messages per step per leader
-
-# Planner & Allocation strategies
-PLANNER_TYPE = "DSTAR_LITE"    # Options: DSTAR_LITE, RRT_STAR
-COVERAGE_STRATEGY = "CVT"      # Options: CVT, Voronoi, Auction
-
-# Sensor model
-DETECTION_PROB = 0.9           # P(detect | victim present)
-FALSE_POS_PROB = 0.05          # P(false detect | no victim)
-
-# Performance
-USE_GPU = True
-BATCH_SIZE = 512               # for batched belief updates
+# Sensing noise (terrain/victim)
+TRUE_OBSTACLE_RATE = 0.95     # P(detect obstacle | obstacle)
+FALSE_OBSTACLE_RATE = 0.05    # P(detect obstacle | free)
+TRUE_POSITIVE_RATE = 0.90     # P(detect victim | victim present)
+FALSE_POSITIVE_RATE = 0.10    # P(detect victim | no victim)
 
 # Communication thresholds
-COMM_BELIEF_THRESH = 10000.0     # L1 belief-change threshold to trigger comm
-COMM_MAP_THRESH = 50           # number of newly-explored cells to trigger comm
-COMM_VICTIM_THRESH = 1         # number of new confirmed victims to trigger comm
-COMM_INTERVAL = 10             # steps between communication gating
+SHARE_THRESHOLD = 100          # Cells of newly explored data before broadcast share
+COMM_RANGE = 20               # Euclidean communication radius (in cells)
+REQUEST_PROB = 0.10           # P(each step to broadcast a confirmation request)
+MAX_SHARE = 20                # Max cells to share per large communication
 
-# Belief‐merge & convergence
-BELIEF_SHARE_FACTOR = 0.5      # δ in [0,1] for partial Bayesian fusion
-KL_CONV_THRESH      = 1e-3     # stop when max pairwise KL < this
-
-if __name__ == "__main__":
-    # Basic sanity tests
-    assert isinstance(MAP_SIZE, int) and MAP_SIZE > 0
-    assert 0 < OBSTACLE_DENSITY < 1
-    assert NUM_ROBOTS > 0
-    assert 0 <= DETECTION_PROB <= 1
-    assert 0 <= FALSE_POS_PROB <= 1
-    print("config.py tests passed.")
+# Environment parameters
+OBSTACLE_THRESHOLD = 0.65     # Perlin‐noise threshold to turn a cell into obstacle
+VICTIM_DENSITY = 0.005         # Fraction of reachable cells containing a victim
