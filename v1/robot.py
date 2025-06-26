@@ -1,157 +1,122 @@
 # robot.py
-
 import numpy as np
-import random
 from planner import astar
-from config import (
-    GRID_SIZE, SENSE_RANGE, ROBOT_SPEED,
-    TRUE_OBSTACLE_RATE, FALSE_OBSTACLE_RATE, TRUE_POSITIVE_RATE, FALSE_POSITIVE_RATE,
-    MAP_UPDATE_THRESHOLD, VICTIM_CONFIDENCE_THRESHOLD
-)
+from config import (SENSE_RANGE, ROBOT_SPEED, TRUE_OBSTACLE_RATE, FALSE_OBSTACLE_RATE,
+                    TRUE_POSITIVE_RATE, FALSE_POSITIVE_RATE, MAP_UPDATE_THRESHOLD,
+                    HIGH_CONFIDENCE_THRESHOLD, ROBOT_HUNT_THRESHOLD)
+import itertools
 
 class Robot:
-    """
-    Represents a single robot. Its sole purpose is to explore its assigned
-    square regions and report findings to a central server.
-    """
     def __init__(self, id, pos, grid_shape, server):
-        self.id = id
-        self.pos = list(pos)
-        self.grid_shape = grid_shape
-        self.server = server
-        self.speed = ROBOT_SPEED
-        self.sense_range = SENSE_RANGE
-
-        # Local maps
-        self.terrain_map = np.full(grid_shape, -1, dtype=np.int8)
-        self.explored_map = np.zeros(grid_shape, dtype=bool)
-        self.victim_confidence_map = np.zeros(grid_shape, dtype=float)
-
-        self.path = []
-        self.target = None
+        self.id=id; self.pos=np.array(pos,dtype=float); self.grid_shape=grid_shape
+        self.server=server; self.speed=ROBOT_SPEED; self.sense_range=SENSE_RANGE
+        self.terrain_map=np.full(grid_shape,-1,dtype=np.int8)
+        self.explored_map=np.zeros(grid_shape,dtype=bool)
+        self.victim_confidence_map=np.zeros(grid_shape,dtype=float)
+        self.path=[]; self.target=None; self.newly_sensed_cells=set()
+        self.path_cache={}; self.mode="EXPLORE"
         
-        self.newly_sensed_cells = []
-
+        # FIX: Re-initialize the frontiers set
         self.frontiers = set()
-        self.assignment_map = None # Provided by the server
-        self.path_cache = {}
 
     def sense(self, true_terrain, true_victims):
-        """
-        Sense the local environment for terrain and victims with noise.
-        """
-        x, y = self.pos
-        H, W = self.grid_shape
-        min_r, max_r = max(0, x - self.sense_range), min(H, x + self.sense_range + 1)
-        min_c, max_c = max(0, y - self.sense_range), min(W, y + self.sense_range + 1)
+        x,y=self.int_pos; H,W=self.grid_shape
+        min_r,max_r=max(0,x-self.sense_range),min(H,x+self.sense_range+1)
+        min_c,max_c=max(0,y-self.sense_range),min(W,y+self.sense_range+1)
+        all_sensed_coords=set((r,c) for r in range(min_r,max_r) for c in range(min_c,max_c))
+        if not all_sensed_coords: return
+        newly_explored={cell for cell in all_sensed_coords if not self.explored_map[cell]}
+        self.newly_sensed_cells.update(newly_explored)
+        if newly_explored: self.explored_map[tuple(zip(*newly_explored))]=True
         
-        sensed_coords = []
-        for r in range(min_r, max_r):
-            for c in range(min_c, max_c):
-                if not self.explored_map[r, c]:
-                    sensed_coords.append((r,c))
-
-        if not sensed_coords:
-            return
-
-        self.newly_sensed_cells.extend(sensed_coords)
-        coords_arr = np.array(sensed_coords)
-        coords_idx = (coords_arr[:, 0], coords_arr[:, 1])
-        self.explored_map[coords_idx] = True
+        for r,c in newly_explored:
+            is_obstacle=true_terrain[r,c]==1
+            detected=(is_obstacle and np.random.random()<TRUE_OBSTACLE_RATE) or (not is_obstacle and np.random.random()<FALSE_OBSTACLE_RATE)
+            self.terrain_map[r,c]=1 if detected else 0
         
-        true_terrain_vals = true_terrain[coords_idx]
-        for i, is_obstacle in enumerate(true_terrain_vals):
-            (r, c) = sensed_coords[i]
-            detected_obstacle = (is_obstacle and np.random.random() < TRUE_OBSTACLE_RATE) or \
-                                (not is_obstacle and np.random.random() < FALSE_OBSTACLE_RATE)
-            self.terrain_map[r, c] = 1 if detected_obstacle else 0
+        for r,c in all_sensed_coords:
+            if self.terrain_map[r,c]==0:
+                is_victim=true_victims[r,c]
+                detected=(is_victim and np.random.random()<TRUE_POSITIVE_RATE) or (not is_victim and np.random.random()<FALSE_POSITIVE_RATE)
+                if detected:
+                    confidence=TRUE_POSITIVE_RATE if is_victim else FALSE_POSITIVE_RATE
+                    self.victim_confidence_map[r,c]+= (1-self.victim_confidence_map[r,c])*confidence
         
-        true_victim_vals = true_victims[coords_idx]
-        for i, is_victim in enumerate(true_victim_vals):
-            (r,c) = sensed_coords[i]
-            if self.terrain_map[r,c] == 0:
-                detected_victim = (is_victim and np.random.random() < TRUE_POSITIVE_RATE) or \
-                                  (not is_victim and np.random.random() < FALSE_POSITIVE_RATE)
-                if detected_victim:
-                    confidence = TRUE_POSITIVE_RATE if is_victim else FALSE_POSITIVE_RATE
-                    self.victim_confidence_map[r, c] = max(self.victim_confidence_map[r, c], confidence)
-
-        for r, c in sensed_coords:
+        # Update frontiers based on newly explored cells
+        for r, c in newly_explored:
             self.frontiers.discard((r, c))
             for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                 nr, nc = r + dr, c + dc
                 if 0 <= nr < H and 0 <= nc < W and not self.explored_map[nr, nc]:
                     self.frontiers.add((nr, nc))
-    
+
     def select_target(self):
-        """
-        Selects a target based on the closest frontier in its assigned region.
-        """
-        if self.assignment_map is None:
-            self.target = tuple(self.pos)
-            return
+        # HUNT mode: Triggered by the server's fast-decaying scent map
+        if self.assignment_map is not None:
+            # The server object is not available in the robot class.
+            # This logic needs to be adapted to use information available to the robot.
+            # For now, we'll base the HUNT mode on the robot's own high-confidence beliefs.
+            high_belief_indices = np.argwhere(self.victim_confidence_map > ROBOT_HUNT_THRESHOLD)
+            my_high_belief_points = [tuple(p) for p in high_belief_indices if self.assignment_map[tuple(p)] == self.id]
 
-        my_frontiers = [f for f in self.frontiers if self.assignment_map[f[0], f[1]] == self.id]
-        
+            if my_high_belief_points:
+                self.mode = "HUNT"
+                strongest_scent_pos = max(my_high_belief_points, key=lambda p: self.victim_confidence_map[p])
+                self.target = tuple(strongest_scent_pos)
+                self.path = []
+                return
+
+        self.mode = "EXPLORE"
+        # Standard frontier exploration
+        if self.assignment_map is None: self.target=self.int_pos; return
+        my_frontiers=[f for f in self.frontiers if self.assignment_map[f[0],f[1]]==self.id]
         if not my_frontiers:
-            mask = (~self.explored_map) & (self.assignment_map == self.id)
-            unexplored_indices = np.argwhere(mask)
-            if unexplored_indices.size > 0:
-                self.target = tuple(unexplored_indices[np.random.randint(len(unexplored_indices))])
-            else:
-                self.target = tuple(self.pos)
+            mask=(~self.explored_map)&(self.assignment_map==self.id)
+            unexplored_indices=np.argwhere(mask)
+            self.target=tuple(unexplored_indices[np.random.randint(len(unexplored_indices))]) if unexplored_indices.size>0 else self.int_pos
+            self.path=[]
             return
-
-        self.target = min(my_frontiers, key=lambda f: abs(f[0] - self.pos[0]) + abs(f[1] - self.pos[1]))
+        self.target=min(my_frontiers,key=lambda f:np.linalg.norm(np.array(f)-self.pos))
+        self.path=[]
 
     def move(self):
-        """
-        Move towards the current target using A* planning.
-        """
-        if self.target is None or tuple(self.pos) == self.target:
-            return
-            
-        if not self.path or self.path[-1] != self.target:
-            self.path = astar(tuple(self.pos), self.target, self.terrain_map, self.path_cache)
-
-        steps_taken = 0
-        while self.path and steps_taken < self.speed:
-            next_pos = self.path.pop(0)
-            if self.terrain_map[next_pos[0], next_pos[1]] != 1:
-                self.pos = list(next_pos)
-                steps_taken += 1
-            else: 
-                self.path = [] 
-                self.path_cache.clear()
-                break
+        if self.target is None or self.int_pos==self.target: self.path=[]; return
+        if not self.path: self.path=astar(self.int_pos,self.target,self.terrain_map,self.path_cache)
+        if self.path and self.int_pos==self.path[0]: self.path.pop(0)
+        if self.path:
+            move_dist=0
+            while self.path and move_dist<self.speed:
+                next_pos=self.path[0]
+                if self.terrain_map[next_pos[0],next_pos[1]]!=1:
+                    dist_to_next=np.linalg.norm(np.array(next_pos)-self.pos)
+                    if move_dist+dist_to_next<=self.speed:
+                        self.pos=np.array(self.path.pop(0),dtype=float); move_dist+=dist_to_next
+                    else:
+                        direction=(np.array(next_pos)-self.pos)/dist_to_next
+                        self.pos+=direction*(self.speed-move_dist); move_dist=self.speed
+                else: self.path=[]; self.path_cache.clear(); break
 
     def communicate(self):
-        """
-        Send map updates to the central server if the threshold is met.
-        """
         if len(self.newly_sensed_cells) >= MAP_UPDATE_THRESHOLD:
-            positions = self.newly_sensed_cells
-            coords = np.array(positions).T
-            terrain_vals = self.terrain_map[tuple(coords)].tolist()
-            confidence_vals = self.victim_confidence_map[tuple(coords)].tolist()
-            explored_vals = self.explored_map[tuple(coords)].tolist()
+            positions = list(self.newly_sensed_cells)
+            coords=np.array(positions).T
             
-            msg = {
-                'sender_id': self.id, 
-                'type': 'map_update', 
-                'positions': positions, 
-                'terrain': terrain_vals, 
-                'confidence': confidence_vals,
-                'explored': explored_vals,
-            }
+            scent_vals = self.victim_confidence_map[tuple(coords)]
+            belief_vals = np.where(scent_vals > HIGH_CONFIDENCE_THRESHOLD, scent_vals, 0)
+
+            msg={'type':'map_update','positions':positions,
+                 'terrain':self.terrain_map[tuple(coords)].tolist(),
+                 'explored':self.explored_map[tuple(coords)].tolist(),
+                 'scent':scent_vals, 'belief':belief_vals}
             self.server.incoming_messages.append(msg)
-            self.newly_sensed_cells = []
-                
+            self.newly_sensed_cells.clear()
+            self.victim_confidence_map[tuple(coords)] *= 0.1
+
     def step(self, true_terrain, true_victims):
-        """
-        Execute one full step of the robot's logic.
-        """
-        self.select_target()
+        self.sense(true_terrain,true_victims)
+        if not self.path: self.select_target()
         self.move()
-        self.sense(true_terrain, true_victims)
         self.communicate()
+
+    @property
+    def int_pos(self): return tuple(np.round(self.pos).astype(int))

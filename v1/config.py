@@ -1,27 +1,46 @@
 # config.py
 
 # Grid and robot parameters
-GRID_SIZE = 100               # Side length of the square grid
-NUM_ROBOTS = 10               # Number of robots
-ROBOT_SPEED = 2               # Cells moved per step (increase to move faster)
-SENSE_RANGE = 2               # Manhattan‐radius of sensing (2 → 5×5 window). Adjustable.
-ALLOC_INTERVAL = 40           # Steps between re‐computing assignment partition
-MAX_STEPS = 300               # Total simulation steps (increased for more thorough exploration)
+GRID_SIZE = 100
+NUM_ROBOTS = 10
+ROBOT_SPEED = 2 # Increased speed to better hunt victims
+SENSE_RANGE = 5 # Increased range for better detection
+MAX_STEPS = 500
 
-# New Tiling strategy parameter
-TILE_SIZE = 10                # The side length of square regions for assignment
+# --- Victim Generation & Motion ---
+INITIAL_MOBILE_VICTIMS = 3
+INITIAL_DRIFTING_VICTIMS = 3
+VICTIM_MOVE_PROBABILITY = 0.3 # Mobile victims have a 30% chance to move each step
+VICTIM_DRIFT_VECTOR = (0.1, 0.1)
 
-# Sensing noise (terrain/victim)
-TRUE_OBSTACLE_RATE = 0.95     # P(detect obstacle | obstacle)
-FALSE_OBSTACLE_RATE = 0.05    # P(detect obstacle | free)
-TRUE_POSITIVE_RATE = 0.90     # P(detect victim | victim present)
-FALSE_POSITIVE_RATE = 0.10    # P(detect victim | no victim)
+# --- Dynamic Victim Spawning ---
+SPAWN_NEW_VICTIMS = True
+VICTIM_SPAWN_INTERVAL = 120
+VICTIM_SPAWN_PROBABILITY = 0.5
 
-# Victim Detection
-VICTIM_CONFIDENCE_THRESHOLD = 0.5 # Confidence threshold for a robot to log a victim
+# --- NEW: Two-Layer Belief System & Communication ---
+SCENT_MAP_DECAY = 0.85          # Scent map decays by 15% each step
+BELIEF_DECAY_INTERVAL = 10
+HIGH_CONFIDENCE_THRESHOLD = 0.80 # Robot's own belief to trigger sending to main belief map
+MAP_UPDATE_THRESHOLD = 40       # Increased to reduce communication
 
-# Communication thresholds
-MAP_UPDATE_THRESHOLD = 50     # Cells of newly explored data before sending a map update to the server
+# --- "Learning" & Advanced Heuristics ---
+ADAPTIVE_DECAY_ENABLED = True
+INITIAL_BELIEF_HALF_LIFE = 250
+MIN_HALF_LIFE = 150
+MAX_HALF_LIFE = 600
+ROBOT_HUNT_THRESHOLD = 0.3 # Server's SCENT value to trigger a robot hunt
 
-OBSTACLE_THRESHOLD= 10
-VICTIM_DENSITY= 0.005 
+# --- Region Assignment ---
+TILE_SIZE = 15
+REASSIGN_INTERVAL = 100
+
+# --- Sensing Noise ---
+TRUE_OBSTACLE_RATE = 0.95
+FALSE_OBSTACLE_RATE = 0.05
+TRUE_POSITIVE_RATE = 0.95 
+FALSE_POSITIVE_RATE = 0.05
+
+# --- Environment Generation ---
+NUM_RIVERS = 2
+RIVER_WIDTH = 2

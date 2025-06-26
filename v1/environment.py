@@ -1,117 +1,139 @@
 # environment.py
 
 import numpy as np
-from noise import pnoise2
 from collections import deque
-from config import GRID_SIZE, OBSTACLE_THRESHOLD, VICTIM_DENSITY
+from config import (GRID_SIZE, INITIAL_MOBILE_VICTIMS,
+                    INITIAL_DRIFTING_VICTIMS, VICTIM_MOVE_PROBABILITY, VICTIM_DRIFT_VECTOR,
+                    NUM_RIVERS, RIVER_WIDTH)
+
+class Victim:
+    def __init__(self, id, pos, motion_type='mobile'):
+        self.id = id; self.pos = np.array(pos, dtype=float)
+        self.motion_type = motion_type
+        self.history = [tuple(np.round(self.pos).astype(int))]
+    def step(self, terrain_map):
+        if self.motion_type == 'mobile':
+            if np.random.random() < VICTIM_MOVE_PROBABILITY:
+                moves = [(-1, 0), (1, 0), (0, -1), (0, 1)]; np.random.shuffle(moves)
+                for move in moves:
+                    next_pos_candidate = self.pos + move
+                    if self._is_valid(np.round(next_pos_candidate).astype(int), terrain_map):
+                        self.pos = next_pos_candidate; break
+        elif self.motion_type == 'drifting':
+            move = np.array(VICTIM_DRIFT_VECTOR) + np.random.randn(2) * 0.1
+            next_pos_candidate = self.pos + move
+            if self._is_valid(np.round(next_pos_candidate).astype(int), terrain_map):
+                self.pos = next_pos_candidate
+        self.pos = np.clip(self.pos, 0, GRID_SIZE - 1)
+        self.history.append(tuple(np.round(self.pos).astype(int)))
+    def _is_valid(self, pos, terrain_map):
+        H, W = terrain_map.shape
+        if not (0 <= pos[0] < H and 0 <= pos[1] < W): return False
+        if terrain_map[pos[0], pos[1]] == 1: return False
+        return True
+    @property
+    def int_pos(self): return tuple(np.round(self.pos).astype(int))
+
 
 class Environment:
-    """
-    Generates a Perlin‐noise terrain, flood‐fills enclosed loops, computes reachability
-    from (0,0), and randomly distributes victims on reachable free cells.
-    """
-
     def __init__(self, grid_size=GRID_SIZE):
         self.grid_size = grid_size
-        self.terrain_map = self._generate_terrain()
-        self._fill_closed_loops()
+        self.terrain_map = self._generate_terrain_with_rivers()
         self.reachable = self._mark_reachable()
-
-        # Any free cell that is not reachable becomes an obstacle
         mask_unreachable = (~self.reachable) & (self.terrain_map == 0)
         self.terrain_map[mask_unreachable] = 1
+        self.victims = self._generate_initial_victims()
+        self.victim_map = np.zeros((self.grid_size, self.grid_size), dtype=bool)
+        self.update_victim_map()
+        self.next_victim_id = len(self.victims)
 
-        self.victim_map = self._generate_victims()
+    def update_victims(self):
+        for victim in self.victims: victim.step(self.terrain_map)
+        self.update_victim_map()
 
-    def _generate_terrain(self):
-        """
-        Use Perlin noise to create smooth‐looking terrain in [0,1], then threshold at OBSTACLE_THRESHOLD.
-        """
-        world = np.zeros((self.grid_size, self.grid_size))
-        scale = 15.0
-        for i in range(self.grid_size):
-            for j in range(self.grid_size):
-                world[i, j] = pnoise2(
-                    i / scale, j / scale,
-                    octaves=4,
-                    persistence=0.5,
-                    lacunarity=2.0,
-                    repeatx=self.grid_size,
-                    repeaty=self.grid_size,
-                    base=0
-                )
-        world = (world - world.min()) / (world.max() - world.min())
-        terrain = (world > OBSTACLE_THRESHOLD).astype(np.int8)
-        terrain[0, 0] = 0  # Ensure the start is free
+    def update_victim_map(self):
+        self.victim_map.fill(False)
+        for victim in self.victims:
+            r, c = victim.int_pos
+            if 0 <= r < self.grid_size and 0 <= c < self.grid_size: self.victim_map[r, c] = True
+
+    def spawn_new_victim(self, explored_map):
+        unexplored_free_cells = np.argwhere(self.reachable & (self.terrain_map == 0) & ~explored_map)
+        if len(unexplored_free_cells) < 10: return False
+        spawn_pos = unexplored_free_cells[np.random.randint(len(unexplored_free_cells))]
+        motion_type = 'mobile' if np.random.rand() > 0.5 else 'drifting'
+        new_victim = Victim(id=f"V_{self.next_victim_id}", pos=spawn_pos, motion_type=motion_type)
+        self.victims.append(new_victim); self.next_victim_id += 1
+        print(f"    -> New '{motion_type}' victim spawned at {tuple(int(x) for x in spawn_pos)}")
+        return True
+
+    def _generate_terrain_with_rivers(self):
+        """Generates a base terrain and then carves random rivers with arbitrary slopes."""
+        terrain = (np.random.random((self.grid_size, self.grid_size)) > 0.98).astype(np.int8)
+
+        for _ in range(NUM_RIVERS):
+            # Select two random points on different edges for an arbitrary slope
+            p1_edge = np.random.randint(4)
+            p2_edge = (p1_edge + np.random.randint(1, 4)) % 4
+            
+            def get_point_on_edge(edge):
+                if edge == 0: return np.array([0, np.random.randint(self.grid_size)]) # Top
+                if edge == 1: return np.array([self.grid_size - 1, np.random.randint(self.grid_size)]) # Bottom
+                if edge == 2: return np.array([np.random.randint(self.grid_size), 0]) # Left
+                return np.array([np.random.randint(self.grid_size), self.grid_size - 1]) # Right
+            
+            p1 = get_point_on_edge(p1_edge).astype(float)
+            p2 = get_point_on_edge(p2_edge).astype(float)
+
+            # Use DDA line algorithm to draw the river path
+            diff = p2 - p1
+            steps = int(np.linalg.norm(diff)) * 2
+            if steps == 0: continue
+            
+            increment = diff / steps
+            direction_norm = increment / np.linalg.norm(increment)
+            perp_norm = np.array([-direction_norm[1], direction_norm[0]])
+
+            current_pos = p1.copy()
+            for _ in range(steps):
+                # Add meandering/wobble
+                wobble = perp_norm * (np.random.random() - 0.5) * 4
+                
+                # Carve out the river width at the current position
+                for w in range(-RIVER_WIDTH // 2, RIVER_WIDTH // 2 + 1):
+                    offset = perp_norm * w
+                    river_pos = current_pos + offset + wobble
+                    r, c = np.round(river_pos).astype(int)
+                    if 0 <= r < self.grid_size and 0 <= c < self.grid_size:
+                        terrain[r, c] = 1 # River is an obstacle
+                
+                current_pos += increment
+                if not (0 <= current_pos[0] < self.grid_size and 0 <= current_pos[1] < self.grid_size):
+                    break
+
+        terrain[0,0] = 0 # Ensure start is always free
         return terrain
 
-    def _fill_closed_loops(self):
-        """
-        Flood‐fill from any border free cell to mark all outside‐connected free cells.
-        Any free cell not reached by that flood must be enclosed → fill with obstacle.
-        """
-        outside = np.ones((self.grid_size, self.grid_size), dtype=bool)
-        queue = deque()
-
-        # Enqueue all border free cells
-        for i in range(self.grid_size):
-            for j in [0, self.grid_size - 1]:
-                if self.terrain_map[i, j] == 0 and outside[i, j]:
-                    queue.append((i, j))
-                    outside[i, j] = False
-            for j2 in range(1, self.grid_size - 1):
-                for i2 in [0, self.grid_size - 1]:
-                    if self.terrain_map[i2, j2] == 0 and outside[i2, j2]:
-                        queue.append((i2, j2))
-                        outside[i2, j2] = False
-
-        # Flood‐fill reachable free cells from border
-        while queue:
-            x, y = queue.popleft()
-            for dx, dy in [(1,0), (-1,0), (0,1), (0,-1)]:
-                nx, ny = x + dx, y + dy
-                if (0 <= nx < self.grid_size and 0 <= ny < self.grid_size
-                        and self.terrain_map[nx, ny] == 0 
-                        and outside[nx, ny]):
-                    outside[nx, ny] = False
-                    queue.append((nx, ny))
-
-        # Any true in `outside` that is still free must be enclosed → obstacle
-        enclosed_mask = outside & (self.terrain_map == 0)
-        self.terrain_map[enclosed_mask] = 1
-
     def _mark_reachable(self):
-        """
-        Starting from (0,0), flood‐fill to mark all free cells reachable by 4‐connectivity.
-        """
         reachable = np.zeros((self.grid_size, self.grid_size), dtype=bool)
-        if self.terrain_map[0,0] == 1: return reachable # Start is blocked
-
-        queue = deque([(0, 0)])
-        reachable[0, 0] = True
-
+        if self.terrain_map[0,0] == 1: return reachable
+        queue = deque([(0, 0)]); reachable[0, 0] = True
         while queue:
             x, y = queue.popleft()
-            for dx, dy in [(1,0), (-1,0), (0,1), (0,-1)]:
+            for dx, dy in [(1,0),(-1,0),(0,1),(0,-1)]:
                 nx, ny = x + dx, y + dy
-                if (0 <= nx < self.grid_size and 0 <= ny < self.grid_size
-                        and self.terrain_map[nx, ny] == 0 
-                        and not reachable[nx, ny]):
-                    reachable[nx, ny] = True
-                    queue.append((nx, ny))
+                if (0<=nx<self.grid_size and 0<=ny<self.grid_size and self.terrain_map[nx,ny]==0 and not reachable[nx,ny]):
+                    reachable[nx,ny] = True; queue.append((nx,ny))
         return reachable
 
-    def _generate_victims(self):
-        """
-        Place ~VICTIM_DENSITY fraction of reachable free cells as victims (boolean mask).
-        """
-        victims = np.zeros((self.grid_size, self.grid_size), dtype=bool)
-        free_cells = np.argwhere(self.reachable & (self.terrain_map == 0))
-        if len(free_cells) == 0: return victims
-        
-        num_victims = max(1, int(VICTIM_DENSITY * len(free_cells)))
-        rng = np.random.default_rng()
-        chosen_indices = rng.choice(len(free_cells), size=num_victims, replace=False)
+    def _generate_initial_victims(self):
+        victims = []; free_cells = np.argwhere(self.reachable & (self.terrain_map == 0))
+        total_victims = INITIAL_MOBILE_VICTIMS + INITIAL_DRIFTING_VICTIMS
+        if len(free_cells) < total_victims: return []
+        rng = np.random.default_rng(); chosen_indices = rng.choice(len(free_cells), size=total_victims, replace=False)
         victim_positions = free_cells[chosen_indices]
-        victims[victim_positions[:, 0], victim_positions[:, 1]] = True
+        for i in range(INITIAL_MOBILE_VICTIMS): victims.append(Victim(id=f"M_{i}", pos=victim_positions[i], motion_type='mobile'))
+        for i in range(INITIAL_DRIFTING_VICTIMS):
+            pos_idx = INITIAL_MOBILE_VICTIMS + i
+            victims.append(Victim(id=f"D_{i}", pos=victim_positions[pos_idx], motion_type='drifting'))
         return victims
